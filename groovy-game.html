@@ -39,14 +39,13 @@
 
 <div id="msg">
   <h1>GROOOVY BEAT</h1>
-  流れてくる手の形を、<b>判定の円に重なるタイミング</b>で作ろう。<br>
+  流れてくる手の形を、<b>黄色い円に着くまでに</b>作ろう。<br>
   ✊ グー　✋ パー　✌️ チョキ　👌 OK<br>
-  <span style="font-size:12px;opacity:.75">画面を見ながら、インカメラに手を向けて遊びます。最初に「タイミング調整」をおすすめします。</span>
+  <span style="font-size:12px;opacity:.75">画面を見ながら、インカメラに手を向けて遊びます。</span>
 </div>
 
 <div id="controls">
   <button id="start">カメラを起動</button>
-  <button id="calib" class="sub hidden">タイミング調整</button>
   <button id="play" class="hidden">PLAY</button>
   <button id="cam" class="sub hidden">カメラ：イン</button>
   <button id="pause" class="sub hidden">一時停止</button>
@@ -76,11 +75,10 @@ function makeChart() {
   }
   return notes;
 }
-const CLICKS = Array.from({ length: 12 }, (_, i) => 0.5 + i * BEAT);   // 調整用クリックの時刻
 
 // ================= 音（<audio> だけを使う。Web Audio は使わない） =================
 function mkAudio(src) { const a = new Audio(src); a.preload = "auto"; a.setAttribute("playsinline", ""); return a; }
-const song = mkAudio("groovy-beat.m4a"), click = mkAudio("groovy-click.m4a");
+const song = mkAudio("groovy-beat.m4a");
 // <audio> の時刻は飛び飛びに進むので、その間は経過時間で補う
 function makeClock(el) {
   let aT = 0, aPerf = 0;
@@ -90,11 +88,8 @@ function makeClock(el) {
     return aT + Math.min(0.2, (now - aPerf) / 1000);
   };
 }
-const songClock = makeClock(song), clickClock = makeClock(click);
+const songClock = makeClock(song);
 
-// ================= 遅れの補正 =================
-let LAT = 0.12;
-try { const v = parseFloat(localStorage.getItem("grooovy_lat")); if (!isNaN(v)) LAT = v; } catch (e) {}
 
 // ================= 背景（GROOOVYの柄） =================
 const glc = $("gl"), gl = glc.getContext("webgl2", { antialias: false });
@@ -194,43 +189,24 @@ function classify(lm) {
 }
 
 // ================= ゲーム状態 =================
-let mode = "idle";           // idle / calib / play / result
+let mode = "idle";           // idle / play / paused / result
 let notes = [], history = [], score = 0, combo = 0, maxCombo = 0, counts = {};
 let popups = [];             // 判定文字
-let calibOnsets = [], prevShape = "none";
 
+// マークが円に着いた時点で、その形になっていれば成功。
+// 手の認識は少し遅れて届くので、着いた直後（〜0.18秒）までのコマも見る。
+const JUDGE_AFTER = 0.18;
 function judge(note) {
-  const T = note.t + LAT;
-  const fr = history.filter(h => h.t >= T - 0.9 && h.t <= T + 0.32);
-  // 目標の形が続いている区間（1コマだけの途切れは無視）
-  const runs = []; let cur = null, gap = 0, prevT = null;
-  for (const h of fr) {
-    // 形が変わった瞬間は、前のコマとこのコマの間とみなす（コマの粗さによる遅れを半分にする）
-    if (h.s === note.shape) { if (!cur) cur = { start: prevT === null ? h.t : (prevT + h.t) / 2, end: h.t, n: 0 }; cur.end = h.t; cur.n++; gap = 0; prevT = h.t; continue; }
-    prevT = h.t;
-    if (cur && gap === 0 && h.s === "none") { gap = 1; }
-    else if (cur) { runs.push(cur); cur = null; gap = 0; }
-  }
-  if (cur) runs.push(cur);
-  let best = null;
-  for (const r of runs) {
-    if (r.n < 2 || r.end < T - 0.1 || r.start > T + 0.26) continue;
-    if (!best || Math.abs(r.start - T) < Math.abs(best.start - T)) best = r;
-  }
-  if (!best) return "MISS";
-  const err = best.start - T;
-  if (err >= -0.10 && err <= 0.08) return "PERFECT";
-  if (err >= -0.20 && err <= 0.16) return "COOL";
-  if (err >= -0.35 && err <= 0.26) return "GOOD";
-  return best.start <= T && best.end >= T ? "GOOD" : "MISS";   // 早めに作って保持していた場合
+  const hits = history.filter(h => h.t >= note.t - 0.06 && h.t <= note.t + JUDGE_AFTER && h.s === note.shape).length;
+  return hits >= 2 ? "NICE!" : "MISS";
 }
-const POINT = { PERFECT: 300, COOL: 200, GOOD: 100, MISS: 0 };
-const JCOLOR = { PERFECT: "#f25f5c", COOL: "#7ea6d6", GOOD: "#f0be3a", MISS: "#8a7a72" };
+const POINT = 100;
+const JCOLOR = { "NICE!": "#f25f5c", MISS: "#8a7a72" };
 
 function applyResult(note, res) {
   note.judged = true; note.result = res; counts[res] = (counts[res] || 0) + 1;
   if (res === "MISS") { combo = 0; bg.shake = 1; }
-  else { combo++; maxCombo = Math.max(maxCombo, combo); score += POINT[res] + Math.min(combo, 50) * 10; bg.pulse = res === "PERFECT" ? 1 : 0.6; }
+  else { combo++; maxCombo = Math.max(maxCombo, combo); score += POINT; bg.pulse = 1; }
   popups.push({ text: res, born: performance.now() });
 }
 
@@ -307,7 +283,7 @@ function drawPlay(t) {
     const x = judgeX + (n.t - t) * pps;
     if (x > W + r * 2) continue;
     if (n.judged) {
-      const age = t - (n.t + LAT + 0.3);
+      const age = t - (n.t + JUDGE_AFTER);
       if (n.result !== "MISS" && age < 0.35) {   // 成功：はじけて消える
         const k = age / 0.35; drawNoteCircle(judgeX, laneY, r * (1 + k * 0.8), null, 1 - k, true);
       } else if (n.result === "MISS" && x > -r * 2) drawNoteCircle(x, laneY, r, n.shape, 0.35);
@@ -325,28 +301,16 @@ function drawPopups() {
   popups = popups.filter(p => now - p.born < 700);
   for (const p of popups) {
     const a = (now - p.born) / 700, sc = a < 0.15 ? 1.5 - a / 0.15 * 0.5 : 1;
-    popText(p.text, W / 2, laneY - 90 - a * 20, p.text === "PERFECT" ? 46 : 42, "#fffaf3", JCOLOR[p.text], sc, a > 0.7 ? (1 - a) / 0.3 : 1);
+    popText(p.text, W / 2, laneY - 90 - a * 20, p.text === "MISS" ? 40 : 48, "#fffaf3", JCOLOR[p.text], sc, a > 0.7 ? (1 - a) / 0.3 : 1);
   }
 }
 
-function drawCalib(t) {
-  const ph = t >= 0.5 ? ((t - 0.5) / BEAT) % 1 : 1;
-  popText("GRIP!", W / 2, H * 0.42, 56, "#fffaf3", "#f25f5c", 1 + 0.15 * Math.exp(-ph * 6));
-  // 次のクリックまでの円
-  const idx = CLICKS.findIndex(c => c > t - 0.05);
-  if (idx >= 0) {
-    const k = Math.max(0, Math.min(1, (CLICKS[idx] - t) / BEAT));
-    ctx.save(); ctx.lineWidth = 6; ctx.strokeStyle = "#4a2a22"; ctx.beginPath(); ctx.arc(W / 2, H * 0.62, 30 + k * 60, 0, Math.PI * 2); ctx.stroke();
-    ctx.fillStyle = "#f0be3a"; ctx.beginPath(); ctx.arc(W / 2, H * 0.62, 30, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.restore();
-  }
-  popText(`${calibOnsets.length} / ${CLICKS.length}`, W / 2, H * 0.78, 26, "#fffaf3", "#7ea6d6");
-}
 
 // ================= メインループ =================
 let last = performance.now();
 function loop(now) {
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
-  const t = (mode === "play" || mode === "paused") ? songClock() : mode === "calib" ? clickClock() : 0;
+  const t = (mode === "play" || mode === "paused") ? songClock() : 0;
 
   if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
@@ -355,18 +319,13 @@ function loop(now) {
     if (lm) { hand.lm = lm; hand.shape = classify(lm); hand.lastSeen = now; }
     else if (now - hand.lastSeen > 150) { hand.lm = null; hand.shape = "none"; }
     if (mode === "play") history.push({ t, s: hand.shape });
-    if (mode === "calib") {
-      if (hand.shape === "fist" && prevShape !== "fist") calibOnsets.push(t);
-      prevShape = hand.shape;
-    }
   }
 
   if (mode === "play") {
-    history = history.filter(h => h.t > t - 2);
-    for (const n of notes) if (!n.judged && t > n.t + LAT + 0.32) applyResult(n, judge(n));
+    history = history.filter(h => h.t > t - 1);
+    for (const n of notes) if (!n.judged && t > n.t + JUDGE_AFTER + 0.03) applyResult(n, judge(n));
     if (song.ended || t > notes[notes.length - 1].t + 2.5) finishPlay();
   }
-  if (mode === "calib" && (click.ended || t > CLICKS[CLICKS.length - 1] + 0.8)) finishCalib();
 
   // 背景
   bg.phase += dt * (mode === "play" ? 0.9 : 0.35);
@@ -382,7 +341,6 @@ function loop(now) {
 
   ctx.clearRect(0, 0, W, H);
   if (mode === "play" || mode === "paused") drawPlay(t);
-  if (mode === "calib") drawCalib(t);
   drawPopups();
   drawWipe();
   requestAnimationFrame(loop);
@@ -390,7 +348,7 @@ function loop(now) {
 
 // ================= 画面の切り替え =================
 function showMsg(html) { msg.innerHTML = html; msg.classList.remove("hidden"); }
-function setButtons(list) { for (const id of ["start", "calib", "play", "cam", "pause", "resume", "title"]) $(id).classList.toggle("hidden", !list.includes(id)); }
+function setButtons(list) { for (const id of ["start", "play", "cam", "pause", "resume", "title"]) $(id).classList.toggle("hidden", !list.includes(id)); }
 
 function startPlay() {
   notes = makeChart(); history = []; score = 0; combo = 0; maxCombo = 0; counts = {}; popups = [];
@@ -398,10 +356,10 @@ function startPlay() {
   mode = "play"; msg.classList.add("hidden"); setButtons(["pause"]);
 }
 function toTitle() {
-  song.pause(); click.pause(); mode = "idle"; msg.style.top = ""; popups = [];
+  song.pause(); mode = "idle"; popups = [];
   $("play").textContent = "PLAY";
-  showMsg(`<h1>GROOOVY BEAT</h1>✊ グー　✋ パー　✌️ チョキ　👌 OK<br><span style="font-size:12px;opacity:.75">今の補正値：${Math.round(LAT * 1000)}ms</span>`);
-  setButtons(["calib", "play", "cam"]);
+  showMsg(`<h1>GROOOVY BEAT</h1>流れてくる手の形を、<b>黄色い円に着くまでに</b>作ろう。<br>✊ グー　✋ パー　✌️ チョキ　👌 OK`);
+  setButtons(["play", "cam"]);
 }
 function pausePlay() { if (mode !== "play") return; song.pause(); mode = "paused"; showMsg("<h1>PAUSE</h1>"); setButtons(["resume", "title"]); }
 function resumePlay() { if (mode !== "paused") return; msg.classList.add("hidden"); const pr = song.play(); if (pr && pr.catch) pr.catch(() => {}); mode = "play"; setButtons(["pause"]); }
@@ -410,47 +368,22 @@ function finishPlay() {
   mode = "result"; song.pause();
   const c = k => counts[k] || 0;
   showMsg(`<h1>RESULT</h1><div class="big">${score}</div>
-    <table><tr><td>PERFECT</td><td>${c("PERFECT")}</td></tr><tr><td>COOL</td><td>${c("COOL")}</td></tr>
-    <tr><td>GOOD</td><td>${c("GOOD")}</td></tr><tr><td>MISS</td><td>${c("MISS")}</td></tr>
+    <table><tr><td>NICE!</td><td>${c("NICE!")} / ${notes.length}</td></tr><tr><td>MISS</td><td>${c("MISS")}</td></tr>
     <tr><td>MAX COMBO</td><td>${maxCombo}</td></tr></table>`);
   $("play").textContent = "もう一度"; setButtons(["play", "title"]);
-}
-function startCalib() {
-  calibOnsets = []; prevShape = hand.shape;
-  click.currentTime = 0; const pr = click.play(); if (pr && pr.catch) pr.catch(() => {});
-  mode = "calib"; setButtons(["title"]);
-  showMsg(`<b>パーの形から、クリック音に合わせて手を握ってください（全12回）。</b>`);
-  msg.style.top = "16%";
-}
-function finishCalib() {
-  mode = "idle"; click.pause(); msg.style.top = "";
-  const d = [];
-  for (const o of calibOnsets) {
-    let best = null; for (const c of CLICKS) if (best === null || Math.abs(o - c) < Math.abs(best)) best = o - c;
-    if (best !== null && Math.abs(best) < 0.45) d.push(best);
-  }
-  if (d.length < 4) {
-    showMsg(`<h1>もう一度</h1>握った回数をうまく読み取れませんでした（${d.length}回）。<br>手全体がカメラに映るようにして、もう一度試してください。<br>今の補正値：${Math.round(LAT * 1000)}ms`);
-  } else {
-    d.sort((a, b) => a - b); LAT = Math.max(-0.1, Math.min(0.45, d[Math.floor(d.length / 2)]));
-    try { localStorage.setItem("grooovy_lat", String(LAT)); } catch (e) {}
-    showMsg(`<h1>OK!</h1>遅れの補正：<b>${Math.round(LAT * 1000)}ms</b>（${d.length}回分の中央値）<br>PLAYで始めよう。`);
-  }
-  setButtons(["calib", "play", "cam"]);
 }
 
 $("start").addEventListener("click", async () => {
   const b = $("start"); b.disabled = true; b.textContent = "準備中…";
   try {
     await startCamera(); await initLandmarker();
-    wipe.style.display = "block"; setButtons(["calib", "play", "cam"]);
-    showMsg(`<h1>READY</h1>まずは「タイミング調整」で、手の認識の遅れを測っておくと判定が正確になります。<br><span style="font-size:12px;opacity:.75">今の補正値：${Math.round(LAT * 1000)}ms</span>`);
+    wipe.style.display = "block"; setButtons(["play", "cam"]);
+    showMsg(`<h1>READY</h1>右上のワイプに手の線が出ていればOK。<br>PLAYで始めよう。`);
   } catch (e) {
     b.disabled = false; b.textContent = "カメラを起動";
     showMsg("起動できませんでした：" + (e && e.message ? e.message : e) + "<br>（https で開いているか、カメラの許可を確認してください）");
   }
 });
-$("calib").addEventListener("click", startCalib);
 $("play").addEventListener("click", startPlay);
 $("pause").addEventListener("click", pausePlay);
 $("resume").addEventListener("click", resumePlay);
