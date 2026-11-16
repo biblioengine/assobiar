@@ -12,6 +12,8 @@
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
   #status { position: fixed; top: calc(env(safe-area-inset-top) + 10px); left: 12px; right: 12px;
     font-size: 12px; line-height: 1.6; color: #fff; text-shadow: 0 1px 3px #000c; pointer-events: none; }
+  #wipe { position: fixed; top: calc(env(safe-area-inset-top) + 40px); right: 12px; width: 108px; height: 144px;
+    inset-inline-start: auto; left: auto; bottom: auto; border-radius: 12px; background: #1b1210cc; border: 1px solid #ffffff40; display: none; }
   #hint { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #fff;
     background: #4a2a22cc; padding: 12px 20px; border-radius: 14px; font-size: 16px; text-align: center; display: none; }
   #controls { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 10px calc(env(safe-area-inset-bottom) + 12px);
@@ -32,13 +34,14 @@
 <div id="help">
   <h1>手で動かすモーショングラフィックス（試作）</h1>
   <ul>
-    <li>👌（OKサイン）を少し保持：スタート</li>
+    <li>👌（OKサイン）を少し保持：スタート／ストップ</li>
     <li>手首を右に傾ける：速く／左：ゆっくり</li>
     <li>指を開く：明るく、うねりが強く</li>
     <li>指を細かく動かす：柄が震える</li>
   </ul>
 </div>
 <div id="status"></div>
+<canvas id="wipe"></canvas>
 <div id="hint"></div>
 <div id="controls">
   <button id="start">カメラを起動</button>
@@ -85,15 +88,20 @@ vec3 band(float i){
   if (k < 6.5) return YELLOW; return PINK;
 }
 float hash(vec2 v){ return fract(sin(dot(v, vec2(127.1, 311.7))) * 43758.5453); }
+// 継ぎ目の出ないなめらかなノイズ（格子点の値を滑らかに補間）
+float vnoise(vec2 x){
+  vec2 i = floor(x), f = fract(x); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1,0)), u.x), mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), u.x), u.y);
+}
 
 void main(){
   vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / min(uRes.x, uRes.y);
   // 震え：細かいランダムなずれ
   if (uVib > 0.001) {
-    float tq = floor(uTime * 30.0);
-    vec2 cell = floor(uv * 6.0);
-    uv += uVib * 0.025 * (vec2(hash(cell + tq), hash(cell + tq + 7.3)) - 0.5);
-    uv += uVib * 0.012 * vec2(sin(uTime * 61.0 + uv.y * 20.0), cos(uTime * 57.0 + uv.x * 20.0));
+    float tt = uTime * 18.0;
+    vec2 n = vec2(vnoise(uv * 3.0 + vec2(tt, 0.0)), vnoise(uv * 3.0 + vec2(0.0, tt) + 5.2)) - 0.5;
+    uv += uVib * 0.03 * n;
+    uv += uVib * 0.008 * vec2(sin(uTime * 61.0 + uv.y * 9.0), cos(uTime * 57.0 + uv.x * 9.0));
   }
   float t = uPhase;
   vec2 q = uv * 1.6;
@@ -129,20 +137,25 @@ const S = { speed: 1, amp: 1, bright: 1, vib: 0 };                    // 平滑�
 // ================= 手の解析 =================
 let landmarker = null, facing = "environment", stream = null, lastVideoTime = -1;
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-const hand = { present: false, ok: false, okSince: 0, tilt: 0, open: 0.5, prevRel: null, prevVel: null, energy: 0, lastSeen: 0 };
+const hand = { present: false, ok: false, okSince: 0, okUsed: false, lm: null, tilt: 0, open: 0.5, prevRel: null, prevVel: null, energy: 0, lastSeen: 0 };
 
 function analyze(lm) {
   const now = performance.now();
   const palm = dist(lm[0], lm[9]) || 1e-3;
-  hand.present = true; hand.lastSeen = now;
+  hand.present = true; hand.lastSeen = now; hand.lm = lm;
 
   // 👌：親指と人差し指の先がくっつき、中指・薬指・小指が伸びている
   const pinch = dist(lm[4], lm[8]) / palm < 0.35;
   const ext = [[12, 10], [16, 14], [20, 18]].every(([tip, pip]) => dist(lm[tip], lm[0]) > dist(lm[pip], lm[0]) * 1.1);
   const ok = pinch && ext;
-  if (ok && !hand.ok) hand.okSince = now;
+  if (ok && !hand.ok) { hand.okSince = now; hand.okUsed = false; }
   hand.ok = ok;
-  if (ok && !P.started && now - hand.okSince > 400) { P.started = true; hintEl.style.display = "none"; }
+  // 👌を保持するたびに、スタートとストップを切り替える（指を離すまで次は反応しない）
+  if (ok && !hand.okUsed && now - hand.okSince > 400) {
+    hand.okUsed = true; P.started = !P.started;
+    hintEl.textContent = P.started ? "" : "ストップ中（👌でスタート）";
+    hintEl.style.display = P.started ? "none" : "block";
+  }
 
   // 手首の傾き → 速さ
   const ang = Math.atan2(lm[9].x - lm[0].x, lm[0].y - lm[9].y);
@@ -192,6 +205,27 @@ async function initLandmarker() {
   catch (e) { landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU")); }
 }
 
+// ================= ワイプ（関節の線だけを表示。カメラ映像は出さない） =================
+const wipe = $("wipe"), wctx = wipe.getContext("2d");
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawWipe() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1), w = 108, h = 144;
+  if (wipe.width !== w * dpr) { wipe.width = w * dpr; wipe.height = h * dpr; }
+  wctx.setTransform(dpr, 0, 0, dpr, 0, 0); wctx.clearRect(0, 0, w, h);
+  const lm = hand.lm; if (!lm) return;
+  // カメラの縦横比に合わせて収める（前面カメラは鏡像にする）
+  const vw = video.videoWidth || 4, vh = video.videoHeight || 3;
+  const sc = Math.min(w / vw, h / vh), ox = (w - vw * sc) / 2, oy = (h - vh * sc) / 2;
+  const pt = p => [ox + (facing === "user" ? 1 - p.x : p.x) * vw * sc, oy + p.y * vh * sc];
+  wctx.lineWidth = 2; wctx.lineCap = "round"; wctx.strokeStyle = hand.ok ? "#f0be3a" : "#f3e9df";
+  wctx.beginPath();
+  for (const [a, b] of BONES) { wctx.moveTo(...pt(lm[a])); wctx.lineTo(...pt(lm[b])); }
+  wctx.stroke();
+  wctx.fillStyle = "#f794b8";
+  for (const p of lm) { const [x, y] = pt(p); wctx.beginPath(); wctx.arc(x, y, 2.4, 0, Math.PI * 2); wctx.fill(); }
+}
+
 // ================= ループ =================
 let last = performance.now();
 function loop(now) {
@@ -201,7 +235,7 @@ function loop(now) {
     const res = landmarker.detectForVideo(video, now);
     const lm = res.landmarks && res.landmarks[0];
     if (lm) analyze(lm);
-    else if (now - hand.lastSeen > 200) { hand.present = false; hand.ok = false; hand.prevRel = hand.prevVel = null; }
+    else if (now - hand.lastSeen > 200) { hand.lm = null; hand.present = false; hand.ok = false; hand.prevRel = hand.prevVel = null; }
   }
   if (!hand.present) { hand.energy *= 0.9; P.vib = Math.min(1, hand.energy); }
 
@@ -221,6 +255,7 @@ function loop(now) {
   gl.uniform1f(uTime, now / 1000);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
+  drawWipe();
   if (landmarker) statusEl.innerHTML = (hand.present ? (hand.ok ? "手：👌" : "手：検出中") : "手：なし")
     + `　速さ ${S.speed.toFixed(2)}倍　開き ${(P.open * 100).toFixed(0)}%　震え ${(S.vib * 100).toFixed(0)}%`;
   requestAnimationFrame(loop);
@@ -232,7 +267,7 @@ $("start").addEventListener("click", async () => {
   const b = $("start"); b.disabled = true; b.textContent = "準備中…";
   try {
     await startCamera(); await initLandmarker();
-    $("help").classList.add("hidden"); b.classList.add("hidden"); $("cam").classList.remove("hidden");
+    $("help").classList.add("hidden"); b.classList.add("hidden"); $("cam").classList.remove("hidden"); wipe.style.display = "block";
     hintEl.textContent = "👌 を少し保持してスタート"; hintEl.style.display = "block";
   } catch (e) {
     b.disabled = false; b.textContent = "カメラを起動";
