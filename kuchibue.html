@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>口笛楽器 試作</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #0b0d12; color: #e8ecf3;
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; overflow: hidden; }
+  #viz { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #status { position: fixed; top: calc(env(safe-area-inset-top) + 12px); left: 14px; right: 14px;
+    font-size: 13px; line-height: 1.6; opacity: .85; pointer-events: none; }
+  #status b { font-weight: 600; }
+  #preview { position: fixed; top: calc(env(safe-area-inset-top) + 12px); right: 12px; width: 120px;
+    border-radius: 10px; overflow: hidden; display: none; border: 1px solid #ffffff30; }
+  #preview video, #preview canvas { width: 100%; display: block; }
+  #preview canvas { position: absolute; inset: 0; height: 100%; }
+  #preview.mirror video, #preview.mirror canvas { transform: scaleX(-1); }
+  #controls { position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 12px 12px calc(env(safe-area-inset-bottom) + 12px);
+    display: flex; gap: 8px; flex-wrap: wrap; justify-content: center;
+    background: linear-gradient(transparent, #0b0d12cc 40%); }
+  button { font: inherit; font-size: 14px; color: #e8ecf3; background: #1d2230; border: 1px solid #ffffff22;
+    border-radius: 999px; padding: 10px 16px; }
+  button.on { background: #3b5bdb; border-color: #3b5bdb; }
+  #start { font-size: 16px; padding: 14px 28px; background: #3b5bdb; border-color: #3b5bdb; }
+  .hidden { display: none !important; }
+  #help { position: fixed; left: 50%; top: 45%; transform: translate(-50%, -50%); width: min(86vw, 360px);
+    font-size: 14px; line-height: 1.8; text-align: left; background: #151a24; border: 1px solid #ffffff1a;
+    border-radius: 14px; padding: 18px 20px; }
+  #help h1 { font-size: 17px; margin: 0 0 8px; }
+  #help ul { margin: 6px 0 0; padding-left: 1.2em; }
+  #help .note { font-size: 12px; opacity: .7; margin-top: 10px; }
+</style>
+</head>
+<body>
+<canvas id="viz"></canvas>
+
+<div id="help">
+  <h1>口笛楽器（試作）</h1>
+  カメラに手を向けて操作します。
+  <ul>
+    <li>手の<b>高さ</b>：音程（上ほど高い）</li>
+    <li>手の<b>開き</b>：息の強さ（握ると止まる）</li>
+    <li>手の<b>傾き</b>：ビブラート</li>
+  </ul>
+  <div class="note">iPhoneはマナーモードだと音が出ない場合があります。</div>
+</div>
+
+<div id="status"></div>
+<div id="preview"><video id="video" playsinline muted autoplay></video><canvas id="overlay"></canvas></div>
+
+<div id="controls">
+  <button id="start">開始</button>
+  <button id="cam" class="hidden">カメラ：背面</button>
+  <button id="snap" class="hidden">スケール吸着：OFF</button>
+  <button id="prev" class="hidden">映像：OFF</button>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- 設定 ----------
+const PITCH_LOW = 76;   // E5 (約659Hz)
+const PITCH_HIGH = 98;  // D7 (約2349Hz)
+const SCALE = [0, 2, 4, 5, 7, 9, 11]; // Cメジャー
+
+// ---------- 要素 ----------
+const $ = id => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), octx = overlay.getContext("2d");
+const viz = $("viz"), vctx = viz.getContext("2d");
+const statusEl = $("status");
+
+let facing = "environment";
+let snapOn = false;
+let previewOn = false;
+let landmarker = null;
+let stream = null;
+let lastVideoTime = -1;
+
+// ---------- 音（口笛の合成） ----------
+let ac, osc, toneGain, noiseSrc, bp, breathGain, burstGain, lfo, lfoGain, master;
+
+function initAudio() {
+  try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+
+  master = ac.createGain(); master.gain.value = 0.6;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -18; comp.ratio.value = 4;
+  master.connect(comp).connect(ac.destination);
+
+  // 音の芯：正弦波
+  osc = ac.createOscillator(); osc.type = "sine"; osc.frequency.value = 1000;
+  toneGain = ac.createGain(); toneGain.gain.value = 0;
+  osc.connect(toneGain).connect(master);
+
+  // ビブラート
+  lfo = ac.createOscillator(); lfo.frequency.value = 5.5;
+  lfoGain = ac.createGain(); lfoGain.gain.value = 0;
+  lfo.connect(lfoGain).connect(osc.frequency);
+
+  // 息のかすれ：音程に追従する帯域ノイズ
+  const len = ac.sampleRate * 2;
+  const buf = ac.createBuffer(1, len, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  noiseSrc = ac.createBufferSource(); noiseSrc.buffer = buf; noiseSrc.loop = true;
+  bp = ac.createBiquadFilter(); bp.type = "bandpass"; bp.frequency.value = 1000; bp.Q.value = 5;
+  breathGain = ac.createGain(); breathGain.gain.value = 0;
+  burstGain = ac.createGain(); burstGain.gain.value = 0;
+  noiseSrc.connect(bp);
+  bp.connect(breathGain).connect(master);
+  bp.connect(burstGain).connect(master);
+
+  osc.start(); lfo.start(); noiseSrc.start();
+}
+
+const midiToHz = m => 440 * Math.pow(2, (m - 69) / 12);
+
+let jitter = 0;        // 音程の微小な揺れ（セント）
+let prevAmp = 0;
+let snappedNote = null;
+
+function quantize(raw) {
+  // ヒステリシス付きでスケール音に吸着
+  if (snappedNote !== null && Math.abs(raw - snappedNote) < 0.75) return snappedNote;
+  let best = null, bestD = 1e9;
+  for (let m = Math.floor(PITCH_LOW) - 2; m <= Math.ceil(PITCH_HIGH) + 2; m++) {
+    if (!SCALE.includes(((m % 12) + 12) % 12)) continue;
+    const dd = Math.abs(raw - m);
+    if (dd < bestD) { bestD = dd; best = m; }
+  }
+  snappedNote = best;
+  return best;
+}
+
+function updateAudio(state) {
+  if (!ac) return;
+  const t = ac.currentTime;
+  const amp = state.present ? state.amp : 0;
+
+  // 吹き始めの息漏れ
+  if (prevAmp < 0.05 && amp >= 0.1) {
+    burstGain.gain.cancelScheduledValues(t);
+    burstGain.gain.setValueAtTime(0, t);
+    burstGain.gain.linearRampToValueAtTime(0.18, t + 0.015);
+    burstGain.gain.setTargetAtTime(0, t + 0.03, 0.05);
+  }
+  prevAmp = amp;
+
+  jitter += (Math.random() - 0.5) * 1.2;
+  jitter *= 0.96;
+  jitter = Math.max(-8, Math.min(8, jitter));
+
+  const pitch = (snapOn ? quantize(state.pitch) : state.pitch) + jitter / 100;
+  const f = midiToHz(pitch);
+  const glide = snapOn ? 0.03 : 0.045;
+  osc.frequency.setTargetAtTime(f, t, glide);
+  bp.frequency.setTargetAtTime(f, t, glide);
+
+  toneGain.gain.setTargetAtTime(Math.pow(amp, 1.4) * 0.5, t, 0.05);
+  breathGain.gain.setTargetAtTime(amp * 0.05, t, 0.02);
+
+  const cents = state.present ? state.vib : 0;
+  lfoGain.gain.setTargetAtTime(f * (Math.pow(2, cents / 1200) - 1), t, 0.08);
+  lfo.frequency.setTargetAtTime(5 + cents / 70 * 1.5, t, 0.2);
+}
+
+// ---------- 手の解析 ----------
+const sm = { y: 0.5, open: 0, tilt: 0 };
+const state = { present: false, pitch: (PITCH_LOW + PITCH_HIGH) / 2, amp: 0, vib: 0, lastSeen: 0 };
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const clamp01 = v => Math.max(0, Math.min(1, v));
+
+function analyze(lm) {
+  const palm = [0, 5, 9, 13, 17].map(i => lm[i]);
+  const cy = palm.reduce((s, p) => s + p.y, 0) / palm.length;
+  const palmSize = dist(lm[0], lm[9]) || 1e-3;
+  const tips = [4, 8, 12, 16, 20];
+  const open = tips.reduce((s, i) => s + dist(lm[i], lm[0]), 0) / tips.length / palmSize;
+  const tilt = Math.atan2(lm[9].x - lm[0].x, lm[0].y - lm[9].y); // 手が真っ直ぐ上向きで0
+
+  const a = 0.35;
+  sm.y += (cy - sm.y) * a;
+  sm.open += (open - sm.open) * a;
+  sm.tilt += (tilt - sm.tilt) * a;
+
+  const yN = clamp01((sm.y - 0.15) / 0.7);
+  state.pitch = PITCH_HIGH - yN * (PITCH_HIGH - PITCH_LOW);
+  state.amp = clamp01((sm.open - 1.15) / 0.7);
+  state.vib = clamp01((Math.abs(sm.tilt) - 0.15) / 0.6) * 70;
+  state.present = true;
+  state.lastSeen = performance.now();
+}
+
+// ---------- カメラ ----------
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: facing }, width: { ideal: 640 }, height: { ideal: 480 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+  lastVideoTime = -1;
+  $("preview").classList.toggle("mirror", facing === "user");
+}
+
+async function initLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = delegate => ({
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate
+    },
+    runningMode: "VIDEO", numHands: 1,
+    minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5
+  });
+  try { landmarker = await HandLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch (e) { landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+
+// ---------- 描画 ----------
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  viz.width = innerWidth * dpr; viz.height = innerHeight * dpr;
+  vctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize); resize();
+
+const pitchToY = p => {
+  const top = innerHeight * 0.14, bottom = innerHeight * 0.8;
+  return bottom - (p - PITCH_LOW) / (PITCH_HIGH - PITCH_LOW) * (bottom - top);
+};
+
+let phase = 0;
+function draw() {
+  const W = innerWidth, H = innerHeight;
+  vctx.fillStyle = "rgba(11,13,18,0.18)";
+  vctx.fillRect(0, 0, W, H);
+
+  if (snapOn) {
+    vctx.strokeStyle = "rgba(255,255,255,0.06)"; vctx.lineWidth = 1;
+    for (let m = PITCH_LOW; m <= PITCH_HIGH; m++) {
+      if (!SCALE.includes(m % 12)) continue;
+      const y = pitchToY(m);
+      vctx.beginPath(); vctx.moveTo(0, y); vctx.lineTo(W, y); vctx.stroke();
+    }
+  }
+
+  const amp = state.present ? state.amp : 0;
+  phase += 0.016 * (5 + state.vib / 70 * 1.5) * Math.PI * 2;
+  const shown = snapOn && snappedNote !== null ? snappedNote : state.pitch;
+  const y = pitchToY(shown) + Math.sin(phase) * state.vib * 0.08 * (state.present ? 1 : 0);
+  const r = 6 + amp * 42;
+  const g = vctx.createRadialGradient(W / 2, y, 0, W / 2, y, r * 2.2);
+  g.addColorStop(0, `rgba(210,225,255,${0.25 + amp * 0.75})`);
+  g.addColorStop(0.45, `rgba(120,150,255,${0.15 + amp * 0.4})`);
+  g.addColorStop(1, "rgba(80,100,255,0)");
+  vctx.fillStyle = g;
+  vctx.beginPath(); vctx.arc(W / 2, y, r * 2.2, 0, Math.PI * 2); vctx.fill();
+}
+
+function drawOverlay(lm) {
+  overlay.width = video.videoWidth || 640; overlay.height = video.videoHeight || 480;
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  if (!lm) return;
+  octx.fillStyle = "#7da2ff";
+  for (const p of lm) {
+    octx.beginPath(); octx.arc(p.x * overlay.width, p.y * overlay.height, 5, 0, Math.PI * 2); octx.fill();
+  }
+}
+
+// ---------- メインループ ----------
+function loop() {
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    const lm = res.landmarks && res.landmarks[0];
+    if (lm) analyze(lm);
+    else if (performance.now() - state.lastSeen > 150) state.present = false;
+    if (previewOn) drawOverlay(lm);
+  }
+  updateAudio(state);
+  draw();
+  statusEl.innerHTML = state.present
+    ? `手：<b>検出中</b>　音程 ${midiToHz(snapOn && snappedNote !== null ? snappedNote : state.pitch).toFixed(0)}Hz　息 ${(state.amp * 100).toFixed(0)}%　揺れ ${state.vib.toFixed(0)}c`
+    : "手：<b>なし</b>（カメラに手を向けてください）";
+  requestAnimationFrame(loop);
+}
+
+// ---------- 操作 ----------
+$("start").addEventListener("click", async () => {
+  const btn = $("start");
+  btn.disabled = true; btn.textContent = "準備中…";
+  try {
+    initAudio();
+    await ac.resume();
+    await startCamera();
+    await initLandmarker();
+    $("help").classList.add("hidden");
+    btn.classList.add("hidden");
+    ["cam", "snap", "prev"].forEach(id => $(id).classList.remove("hidden"));
+    requestAnimationFrame(loop);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "開始";
+    statusEl.textContent = "起動できませんでした：" + (e && e.message ? e.message : e)
+      + "（https で開いているか、カメラの許可を確認してください）";
+  }
+});
+
+$("cam").addEventListener("click", async () => {
+  facing = facing === "environment" ? "user" : "environment";
+  $("cam").textContent = "カメラ：" + (facing === "user" ? "前面" : "背面");
+  try { await startCamera(); } catch (e) { statusEl.textContent = "カメラ切替に失敗：" + e.message; }
+});
+
+$("snap").addEventListener("click", () => {
+  snapOn = !snapOn; snappedNote = null;
+  $("snap").textContent = "スケール吸着：" + (snapOn ? "ON" : "OFF");
+  $("snap").classList.toggle("on", snapOn);
+});
+
+$("prev").addEventListener("click", () => {
+  previewOn = !previewOn;
+  $("preview").style.display = previewOn ? "block" : "none";
+  $("prev").textContent = "映像：" + (previewOn ? "ON" : "OFF");
+  $("prev").classList.toggle("on", previewOn);
+});
+</script>
+</body>
+</html>
