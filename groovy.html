@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>手で動かすモーショングラフィックス（試作）</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #f3e9df; overflow: hidden;
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; touch-action: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #status { position: fixed; top: calc(env(safe-area-inset-top) + 10px); left: 12px; right: 12px;
+    font-size: 12px; line-height: 1.6; color: #fff; text-shadow: 0 1px 3px #000c; pointer-events: none; }
+  #hint { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #fff;
+    background: #4a2a22cc; padding: 12px 20px; border-radius: 14px; font-size: 16px; text-align: center; display: none; }
+  #controls { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 10px calc(env(safe-area-inset-bottom) + 12px);
+    display: flex; gap: 8px; justify-content: center; }
+  button { font: inherit; font-size: 14px; color: #fff; background: #4a2a22cc; border: 1px solid #ffffff40;
+    border-radius: 999px; padding: 10px 16px; }
+  #start { font-size: 16px; padding: 14px 28px; }
+  .hidden { display: none !important; }
+  #help { position: fixed; left: 50%; top: 45%; transform: translate(-50%, -50%); width: min(88vw, 360px);
+    font-size: 14px; line-height: 1.8; color: #3a221c; background: #fffaf3; border: 2px solid #4a2a22; border-radius: 16px; padding: 18px 20px; }
+  #help h1 { font-size: 17px; margin: 0 0 8px; }
+  #help ul { margin: 6px 0 0; padding-left: 1.2em; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="help">
+  <h1>手で動かすモーショングラフィックス（試作）</h1>
+  <ul>
+    <li>👌（OKサイン）を少し保持：スタート</li>
+    <li>手首を右に傾ける：速く／左：ゆっくり</li>
+    <li>指を開く：明るく、うねりが強く</li>
+    <li>指を細かく動かす：柄が震える</li>
+  </ul>
+</div>
+<div id="status"></div>
+<div id="hint"></div>
+<div id="controls">
+  <button id="start">カメラを起動</button>
+  <button id="cam" class="hidden">カメラ：背面</button>
+</div>
+<video id="video" playsinline muted autoplay class="hidden"></video>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("gl"), statusEl = $("status"), hintEl = $("hint");
+
+// ================= 描画（WebGL2） =================
+const gl = canvas.getContext("webgl2", { antialias: false });
+const SCALE = Math.min(1.5, window.devicePixelRatio || 1);
+function resize() { canvas.width = Math.round(innerWidth * SCALE); canvas.height = Math.round(innerHeight * SCALE); }
+addEventListener("resize", resize); resize();
+
+const VS = `#version 300 es
+in vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }`;
+const FS = `#version 300 es
+precision highp float;
+uniform vec2 uRes;
+uniform float uPhase;    // 流れの進み（速さを積算したもの）
+uniform float uAmp;      // うねりの強さ
+uniform float uBright;   // 明るさ
+uniform float uVib;      // 震え
+uniform float uTime;
+out vec4 o;
+
+const vec3 CREAM  = vec3(0.953, 0.914, 0.875);
+const vec3 BLUE   = vec3(0.494, 0.651, 0.839);
+const vec3 YELLOW = vec3(0.941, 0.745, 0.227);
+const vec3 PINK   = vec3(0.969, 0.580, 0.722);
+const vec3 RED    = vec3(0.949, 0.373, 0.361);
+const vec3 LINE   = vec3(0.290, 0.165, 0.133);
+
+vec3 band(float i){
+  // 赤→ピンク→黄→青→クリーム→青→黄→ピンク の順に繰り返す
+  float k = mod(i, 8.0);
+  if (k < 0.5) return RED;   if (k < 1.5) return PINK;  if (k < 2.5) return YELLOW;
+  if (k < 3.5) return BLUE;  if (k < 4.5) return CREAM; if (k < 5.5) return BLUE;
+  if (k < 6.5) return YELLOW; return PINK;
+}
+float hash(vec2 v){ return fract(sin(dot(v, vec2(127.1, 311.7))) * 43758.5453); }
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / min(uRes.x, uRes.y);
+  // 震え：細かいランダムなずれ
+  if (uVib > 0.001) {
+    float tq = floor(uTime * 30.0);
+    vec2 cell = floor(uv * 6.0);
+    uv += uVib * 0.025 * (vec2(hash(cell + tq), hash(cell + tq + 7.3)) - 0.5);
+    uv += uVib * 0.012 * vec2(sin(uTime * 61.0 + uv.y * 20.0), cos(uTime * 57.0 + uv.x * 20.0));
+  }
+  float t = uPhase;
+  vec2 q = uv * 1.6;
+  // 二段のドメインワープでうねる帯を作る
+  q += uAmp * 0.55 * vec2(sin(q.y * 1.7 + t * 0.9), cos(q.x * 1.5 - t * 0.7));
+  q += uAmp * 0.35 * vec2(sin(q.y * 2.9 - t * 0.6 + q.x), cos(q.x * 2.6 + t * 0.8 - q.y));
+  float f = q.x + 0.75 * sin(q.y * 1.3 + t * 0.5) + 0.25 * length(q) * sin(t * 0.3);
+  float b = f * 2.2 - t * 0.6;
+  float idx = floor(b), fr = fract(b);
+  vec3 col = band(idx);
+  // 帯の境目に茶色の線（太さは画面ピクセル基準）
+  float d = min(fr, 1.0 - fr) / max(fwidth(b), 1e-4);
+  float lw = 1.1 * (uRes.y / 900.0 + 0.6);
+  col = mix(LINE, col, smoothstep(lw - 0.8, lw + 0.8, d));
+  col *= uBright;
+  o = vec4(col, 1.0);
+}`;
+function sh(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog); gl.useProgram(prog);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const aP = gl.getAttribLocation(prog, "p"); gl.enableVertexAttribArray(aP); gl.vertexAttribPointer(aP, 2, gl.FLOAT, false, 0, 0);
+const U = n => gl.getUniformLocation(prog, n);
+const uRes = U("uRes"), uPhase = U("uPhase"), uAmp = U("uAmp"), uBright = U("uBright"), uVib = U("uVib"), uTime = U("uTime");
+
+// ================= 状態 =================
+const P = { started: false, phase: 0, speed: 1, open: 0.5, vib: 0 };   // 目標値
+const S = { speed: 1, amp: 1, bright: 1, vib: 0 };                    // 平滑化した表示値
+
+// ================= 手の解析 =================
+let landmarker = null, facing = "environment", stream = null, lastVideoTime = -1;
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const hand = { present: false, ok: false, okSince: 0, tilt: 0, open: 0.5, prevRel: null, prevVel: null, energy: 0, lastSeen: 0 };
+
+function analyze(lm) {
+  const now = performance.now();
+  const palm = dist(lm[0], lm[9]) || 1e-3;
+  hand.present = true; hand.lastSeen = now;
+
+  // 👌：親指と人差し指の先がくっつき、中指・薬指・小指が伸びている
+  const pinch = dist(lm[4], lm[8]) / palm < 0.35;
+  const ext = [[12, 10], [16, 14], [20, 18]].every(([tip, pip]) => dist(lm[tip], lm[0]) > dist(lm[pip], lm[0]) * 1.1);
+  const ok = pinch && ext;
+  if (ok && !hand.ok) hand.okSince = now;
+  hand.ok = ok;
+  if (ok && !P.started && now - hand.okSince > 400) { P.started = true; hintEl.style.display = "none"; }
+
+  // 手首の傾き → 速さ
+  const ang = Math.atan2(lm[9].x - lm[0].x, lm[0].y - lm[9].y);
+  hand.tilt += (ang - hand.tilt) * 0.3;
+  let t = Math.max(-1, Math.min(1, hand.tilt / 0.7));
+  t = Math.abs(t) < 0.15 ? 0 : (t - Math.sign(t) * 0.15) / 0.85;
+  P.speed = t >= 0 ? 1 + t * 2 : 1 + t * 0.8;     // 0.2〜3.0倍
+
+  // 指の開き → 明るさ・うねりの強さ（👌の最中は変えない）
+  const tips = [4, 8, 12, 16, 20];
+  if (!ok) {
+    const open = tips.reduce((s, i) => s + dist(lm[i], lm[0]), 0) / tips.length / palm;
+    P.open = Math.max(0, Math.min(1, (open - 1.1) / 0.8));
+  }
+
+  // 指の細かい動き → 震え
+  // 手のひら基準の座標（手の傾きで回転を打ち消す）で、指先の「加速度」を測る。
+  // ゆっくり開閉するだけでは小さく、小刻みに動かすと大きくなる。
+  const c = Math.cos(-ang), s = Math.sin(-ang);
+  const rel = tips.map(i => { const x = (lm[i].x - lm[0].x) / palm, y = (lm[i].y - lm[0].y) / palm; return [x * c - y * s, x * s + y * c]; });
+  if (hand.prevRel) {
+    const vel = rel.map((r, k) => [r[0] - hand.prevRel[k][0], r[1] - hand.prevRel[k][1]]);
+    if (hand.prevVel) {
+      let acc = 0;
+      vel.forEach((v, k) => { acc += Math.hypot(v[0] - hand.prevVel[k][0], v[1] - hand.prevVel[k][1]); });
+      const e = Math.max(0, acc - 0.12) / 0.4;
+      hand.energy = Math.max(e, hand.energy * 0.9);
+    }
+    hand.prevVel = vel;
+  }
+  hand.prevRel = rel;
+  P.vib = Math.min(1, hand.energy);
+}
+
+// ================= カメラ =================
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: facing }, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+  video.srcObject = stream; await video.play(); lastVideoTime = -1;
+  hand.prevRel = hand.prevVel = null;
+}
+async function initLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = delegate => ({ baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate },
+    runningMode: "VIDEO", numHands: 1 });
+  try { landmarker = await HandLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch (e) { landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+
+// ================= ループ =================
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    const lm = res.landmarks && res.landmarks[0];
+    if (lm) analyze(lm);
+    else if (now - hand.lastSeen > 200) { hand.present = false; hand.ok = false; hand.prevRel = hand.prevVel = null; }
+  }
+  if (!hand.present) { hand.energy *= 0.9; P.vib = Math.min(1, hand.energy); }
+
+  // 平滑化
+  S.speed += (P.speed - S.speed) * 0.08;
+  S.amp += ((0.35 + P.open * 1.3) - S.amp) * 0.08;
+  S.bright += ((0.75 + P.open * 0.4) - S.bright) * 0.08;
+  S.vib += (P.vib - S.vib) * 0.35;
+  if (P.started) P.phase += dt * S.speed;
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uPhase, P.phase);
+  gl.uniform1f(uAmp, S.amp);
+  gl.uniform1f(uBright, S.bright);
+  gl.uniform1f(uVib, P.started ? S.vib : 0);
+  gl.uniform1f(uTime, now / 1000);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  if (landmarker) statusEl.innerHTML = (hand.present ? (hand.ok ? "手：👌" : "手：検出中") : "手：なし")
+    + `　速さ ${S.speed.toFixed(2)}倍　開き ${(P.open * 100).toFixed(0)}%　震え ${(S.vib * 100).toFixed(0)}%`;
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ================= 操作 =================
+$("start").addEventListener("click", async () => {
+  const b = $("start"); b.disabled = true; b.textContent = "準備中…";
+  try {
+    await startCamera(); await initLandmarker();
+    $("help").classList.add("hidden"); b.classList.add("hidden"); $("cam").classList.remove("hidden");
+    hintEl.textContent = "👌 を少し保持してスタート"; hintEl.style.display = "block";
+  } catch (e) {
+    b.disabled = false; b.textContent = "カメラを起動";
+    statusEl.textContent = "起動できませんでした：" + (e && e.message ? e.message : e) + "（https で開いているか、カメラの許可を確認してください）";
+  }
+});
+$("cam").addEventListener("click", async () => {
+  facing = facing === "environment" ? "user" : "environment";
+  $("cam").textContent = "カメラ：" + (facing === "user" ? "前面" : "背面");
+  try { await startCamera(); } catch (e) { statusEl.textContent = "カメラ切替に失敗：" + e.message; }
+});
+</script>
+</body>
+</html>
