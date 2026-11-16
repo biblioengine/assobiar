@@ -67,6 +67,9 @@ const FONT = '"Bagel Fat One", -apple-system, sans-serif';
 
 // ================= 曲・譜面 =================
 const BPM = 96, BEAT = 60 / BPM;
+let BEATc = BEAT;   // 今の曲の1拍の長さ（テンポごとに別の曲ファイルを使う）
+// 再生速度を変えると画面収録に音が入らなくなるため、テンポごとに作った曲を等速で鳴らす
+const beatFile = rate => { const k = Math.round(rate * 100); return k === 100 ? "groovy-beat.m4a" : `groovy-beat-${k}.m4a`; };
 const SHAPES = { fist: "✊", open: "✋", victory: "✌️", ok: "👌", point: "👉", rock: "🤘", thumb: "👍" };
 const BASIC = ["fist", "open", "victory", "ok"], PLUS = [...BASIC, "point", "rock"], ALL = [...PLUS, "thumb"];
 // ステージ設定：間隔（拍）・使う形・テンポ倍率・小節数
@@ -82,7 +85,7 @@ function makeChart(conf, seedN) {
   const notes = []; let prev = null;
   for (let b = 2 * 4; b < (2 + conf.bars) * 4; b += conf.interval) {
     let s; do { s = conf.shapes[Math.floor(rnd() * conf.shapes.length)]; } while (s === prev);   // 同じ形は続けない
-    prev = s; notes.push({ t: b * BEAT, shape: s, judged: false, result: null });
+    prev = s; notes.push({ t: b * BEATc, shape: s, judged: false, result: null });
   }
   return notes;
 }
@@ -284,16 +287,16 @@ function drawNoteCircle(x, y, r, shape, alpha = 1, ring = false) {
 }
 
 function drawPlay(t) {
-  const laneY = H * 0.6, judgeX = W * 0.22, pps = W * (conf && conf.interval === 1 ? 0.58 : 0.42), r = Math.min(40, W * 0.1);
+  const laneY = H * 0.6, judgeX = W * 0.22, pps = W * (conf && conf.interval === 1 ? 0.58 : 0.42) * (conf ? conf.rate : 1), r = Math.min(40, W * 0.1);
   // レーン
   ctx.fillStyle = "rgba(74,42,34,0.82)"; ctx.fillRect(0, laneY - r - 12, W, (r + 12) * 2);
   ctx.fillStyle = "rgba(255,250,243,0.12)"; ctx.fillRect(0, laneY - r - 6, W, (r + 6) * 2);
   // 拍の目盛り
   ctx.strokeStyle = "rgba(255,250,243,0.25)"; ctx.lineWidth = 2;
-  const b0 = Math.floor(t / BEAT);
-  for (let b = b0; b < b0 + 8; b++) { const x = judgeX + (b * BEAT - t) * pps; if (x > judgeX + 4) { ctx.beginPath(); ctx.moveTo(x, laneY - r - 6); ctx.lineTo(x, laneY + r + 6); ctx.stroke(); } }
+  const b0 = Math.floor(t / BEATc);
+  for (let b = b0; b < b0 + 8; b++) { const x = judgeX + (b * BEATc - t) * pps; if (x > judgeX + 4) { ctx.beginPath(); ctx.moveTo(x, laneY - r - 6); ctx.lineTo(x, laneY + r + 6); ctx.stroke(); } }
   // 判定の円（拍に合わせて脈打つ）
-  const beatPh = (t / BEAT) % 1, pulse = 1 + 0.08 * Math.exp(-beatPh * 6);
+  const beatPh = (t / BEATc) % 1, pulse = 1 + 0.08 * Math.exp(-beatPh * 6);
   ctx.save(); ctx.lineWidth = 5; ctx.strokeStyle = "#f0be3a";
   ctx.beginPath(); ctx.arc(judgeX, laneY, r * 1.12 * pulse, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
   // ノーツ
@@ -372,8 +375,11 @@ function setButtons(list) { for (const id of ["start", "play", "hard", "next", "
 function beginRun(n, isHard, keepScore) {
   stage = n; hardcore = isHard; conf = isHard ? HARD : stageConf(n);
   if (!keepScore) { score = 0; maxCombo = 0; }
+  BEATc = BEAT / conf.rate;
+  const src = beatFile(conf.rate);
+  if (!song.src.endsWith(src)) { song.src = src; song.load(); }
+  song.playbackRate = 1;
   notes = makeChart(conf, isHard ? 99 : n); history = []; combo = keepScore ? combo : 0; counts = {}; stageNice = 0; popups = [];
-  song.playbackRate = conf.rate; song.preservesPitch = true; song.webkitPreservesPitch = true;   // 速くしても音の高さは変えない
   song.currentTime = 0; const pr = song.play(); if (pr && pr.catch) pr.catch(() => {});
   popups.push({ text: isHard ? "HARDCORE" : `STAGE ${n}`, born: performance.now(), big: true });
   mode = "play"; msg.classList.add("hidden"); setButtons(["pause"]);
