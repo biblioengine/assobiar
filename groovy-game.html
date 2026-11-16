@@ -40,13 +40,16 @@
 <div id="msg">
   <h1>GROOOVY BEAT</h1>
   流れてくる手の形を、<b>黄色い円に着くまでに</b>作ろう。<br>
-  ✊ グー　✋ パー　✌️ チョキ　👌 OK<br>
+  ✊ グー　✋ パー　✌️ チョキ　👌 OK<br>👉 指差し　🤘 メロイック　👍 グッド<br>
   <span style="font-size:12px;opacity:.75">画面を見ながら、インカメラに手を向けて遊びます。</span>
 </div>
 
 <div id="controls">
   <button id="start">カメラを起動</button>
   <button id="play" class="hidden">PLAY</button>
+  <button id="hard" class="hidden" style="background:#4a2a22">HARDCORE</button>
+  <button id="next" class="hidden">NEXT STAGE</button>
+  <button id="retry" class="hidden">もう一度</button>
   <button id="cam" class="sub hidden">カメラ：イン</button>
   <button id="pause" class="sub hidden">一時停止</button>
   <button id="resume" class="hidden">続ける</button>
@@ -64,14 +67,22 @@ const FONT = '"Bagel Fat One", -apple-system, sans-serif';
 
 // ================= 曲・譜面 =================
 const BPM = 96, BEAT = 60 / BPM;
-const SHAPES = { fist: "✊", open: "✋", victory: "✌️", ok: "👌" };
-const KEYS = Object.keys(SHAPES);
-function makeChart() {
-  let seed = 20261117; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+const SHAPES = { fist: "✊", open: "✋", victory: "✌️", ok: "👌", point: "👉", rock: "🤘", thumb: "👍" };
+const BASIC = ["fist", "open", "victory", "ok"], PLUS = [...BASIC, "point", "rock"], ALL = [...PLUS, "thumb"];
+// ステージ設定：間隔（拍）・使う形・テンポ倍率・小節数
+function stageConf(n) {
+  if (n === 1) return { interval: 2, shapes: BASIC, rate: 1.0, bars: 8 };
+  if (n === 2) return { interval: 2, shapes: PLUS,  rate: 1.1, bars: 8 };
+  if (n === 3) return { interval: 1, shapes: PLUS,  rate: 1.1, bars: 8 };
+  return { interval: 1, shapes: ALL, rate: Math.min(1.6, 1.25 + (n - 4) * 0.1), bars: 8 };   // 4以降は👍も混ざり、速くなり続ける
+}
+const HARD = { interval: 1, shapes: ALL, rate: 1.5, bars: 16 };
+function makeChart(conf, seedN) {
+  let seed = 20261117 + seedN * 7919; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
   const notes = []; let prev = null;
-  for (let bar = 2; bar < 18; bar++) for (let k = 0; k < 2; k++) {
-    let s; do { s = KEYS[Math.floor(rnd() * KEYS.length)]; } while (s === prev);   // 同じ形は続けない
-    prev = s; notes.push({ t: (bar * 4 + k * 2) * BEAT, shape: s, judged: false, result: null });
+  for (let b = 2 * 4; b < (2 + conf.bars) * 4; b += conf.interval) {
+    let s; do { s = conf.shapes[Math.floor(rnd() * conf.shapes.length)]; } while (s === prev);   // 同じ形は続けない
+    prev = s; notes.push({ t: b * BEAT, shape: s, judged: false, result: null });
   }
   return notes;
 }
@@ -184,13 +195,20 @@ function classify(lm) {
   if (pinch && m && r && p) return "ok";
   if (i && m && r && p) return "open";
   if (i && m && !r && !p) return "victory";
-  if (!i && !m && !r && !p) return "fist";
+  if (i && !m && !r && p) return "rock";
+  if (i && !m && !r && !p) return "point";
+  if (!i && !m && !r && !p) {
+    // 親指が手のひらから離れて伸びていれば👍、そうでなければ✊
+    const thumbOut = dist(lm[4], lm[5]) / palm > 0.6 && dist(lm[4], lm[0]) > dist(lm[3], lm[0]);
+    return thumbOut ? "thumb" : "fist";
+  }
   return "none";
 }
 
 // ================= ゲーム状態 =================
 let mode = "idle";           // idle / play / paused / result
 let notes = [], history = [], score = 0, combo = 0, maxCombo = 0, counts = {};
+let stage = 1, hardcore = false, conf = null, stageNice = 0;
 let popups = [];             // 判定文字
 
 // マークが円に着いた時点で、その形になっていれば成功。
@@ -206,7 +224,7 @@ const JCOLOR = { "NICE!": "#f25f5c", MISS: "#8a7a72" };
 function applyResult(note, res) {
   note.judged = true; note.result = res; counts[res] = (counts[res] || 0) + 1;
   if (res === "MISS") { combo = 0; bg.shake = 1; }
-  else { combo++; maxCombo = Math.max(maxCombo, combo); score += POINT; bg.pulse = 1; }
+  else { combo++; stageNice++; maxCombo = Math.max(maxCombo, combo); score += POINT; bg.pulse = 1; }
   popups.push({ text: res, born: performance.now() });
 }
 
@@ -266,7 +284,7 @@ function drawNoteCircle(x, y, r, shape, alpha = 1, ring = false) {
 }
 
 function drawPlay(t) {
-  const laneY = H * 0.6, judgeX = W * 0.22, pps = W * 0.42, r = Math.min(40, W * 0.1);
+  const laneY = H * 0.6, judgeX = W * 0.22, pps = W * (conf && conf.interval === 1 ? 0.58 : 0.42), r = Math.min(40, W * 0.1);
   // レーン
   ctx.fillStyle = "rgba(74,42,34,0.82)"; ctx.fillRect(0, laneY - r - 12, W, (r + 12) * 2);
   ctx.fillStyle = "rgba(255,250,243,0.12)"; ctx.fillRect(0, laneY - r - 6, W, (r + 6) * 2);
@@ -293,15 +311,16 @@ function drawPlay(t) {
   }
   // スコア・コンボ
   popText(String(score).padStart(6, "0"), 92, 56, 30, "#fffaf3", "#f794b8");
+  popText(hardcore ? "HARDCORE" : `STAGE ${stage}`, 72, 92, 18, "#fffaf3", hardcore ? "#f25f5c" : "#7ea6d6");
   if (combo >= 2) popText(`${combo} COMBO`, W / 2, laneY + r + 46, 24, "#fffaf3", "#7ea6d6");
 }
 
 function drawPopups() {
   const now = performance.now(), laneY = H * 0.6;
-  popups = popups.filter(p => now - p.born < 700);
+  popups = popups.filter(p => now - p.born < (p.big ? 1400 : 700));
   for (const p of popups) {
-    const a = (now - p.born) / 700, sc = a < 0.15 ? 1.5 - a / 0.15 * 0.5 : 1;
-    popText(p.text, W / 2, laneY - 90 - a * 20, p.text === "MISS" ? 40 : 48, "#fffaf3", JCOLOR[p.text], sc, a > 0.7 ? (1 - a) / 0.3 : 1);
+    const a = (now - p.born) / (p.big ? 1400 : 700), sc = a < 0.15 ? 1.5 - a / 0.15 * 0.5 : 1;
+    popText(p.text, W / 2, p.big ? H * 0.32 : laneY - 90 - a * 20, p.big ? 52 : p.text === "MISS" ? 40 : 48, "#fffaf3", JCOLOR[p.text] || "#f0be3a", sc, a > 0.7 ? (1 - a) / 0.3 : 1);
   }
 }
 
@@ -324,7 +343,7 @@ function loop(now) {
   if (mode === "play") {
     history = history.filter(h => h.t > t - 1);
     for (const n of notes) if (!n.judged && t > n.t + JUDGE_AFTER + 0.03) applyResult(n, judge(n));
-    if (song.ended || t > notes[notes.length - 1].t + 2.5) finishPlay();
+    if (song.ended || t > notes[notes.length - 1].t + 1.5) finishPlay();
   }
 
   // 背景
@@ -348,36 +367,48 @@ function loop(now) {
 
 // ================= 画面の切り替え =================
 function showMsg(html) { msg.innerHTML = html; msg.classList.remove("hidden"); }
-function setButtons(list) { for (const id of ["start", "play", "cam", "pause", "resume", "title"]) $(id).classList.toggle("hidden", !list.includes(id)); }
+function setButtons(list) { for (const id of ["start", "play", "hard", "next", "retry", "cam", "pause", "resume", "title"]) $(id).classList.toggle("hidden", !list.includes(id)); }
 
-function startPlay() {
-  notes = makeChart(); history = []; score = 0; combo = 0; maxCombo = 0; counts = {}; popups = [];
+function beginRun(n, isHard, keepScore) {
+  stage = n; hardcore = isHard; conf = isHard ? HARD : stageConf(n);
+  if (!keepScore) { score = 0; maxCombo = 0; }
+  notes = makeChart(conf, isHard ? 99 : n); history = []; combo = keepScore ? combo : 0; counts = {}; stageNice = 0; popups = [];
+  song.playbackRate = conf.rate; song.preservesPitch = true; song.webkitPreservesPitch = true;   // 速くしても音の高さは変えない
   song.currentTime = 0; const pr = song.play(); if (pr && pr.catch) pr.catch(() => {});
+  popups.push({ text: isHard ? "HARDCORE" : `STAGE ${n}`, born: performance.now(), big: true });
   mode = "play"; msg.classList.add("hidden"); setButtons(["pause"]);
 }
+function startPlay() { beginRun(1, false, false); }
 function toTitle() {
   song.pause(); mode = "idle"; popups = [];
-  $("play").textContent = "PLAY";
-  showMsg(`<h1>GROOOVY BEAT</h1>流れてくる手の形を、<b>黄色い円に着くまでに</b>作ろう。<br>✊ グー　✋ パー　✌️ チョキ　👌 OK`);
-  setButtons(["play", "cam"]);
+  showMsg(`<h1>GROOOVY BEAT</h1>流れてくる手の形を、<b>黄色い円に着くまでに</b>作ろう。<br>✊ グー　✋ パー　✌️ チョキ　👌 OK<br>👉 指差し　🤘 メロイック　👍 グッド`);
+  setButtons(["play", "hard", "cam"]);
 }
 function pausePlay() { if (mode !== "play") return; song.pause(); mode = "paused"; showMsg("<h1>PAUSE</h1>"); setButtons(["resume", "title"]); }
 function resumePlay() { if (mode !== "paused") return; msg.classList.add("hidden"); const pr = song.play(); if (pr && pr.catch) pr.catch(() => {}); mode = "play"; setButtons(["pause"]); }
 
 function finishPlay() {
   mode = "result"; song.pause();
-  const c = k => counts[k] || 0;
-  showMsg(`<h1>RESULT</h1><div class="big">${score}</div>
-    <table><tr><td>NICE!</td><td>${c("NICE!")} / ${notes.length}</td></tr><tr><td>MISS</td><td>${c("MISS")}</td></tr>
-    <tr><td>MAX COMBO</td><td>${maxCombo}</td></tr></table>`);
-  $("play").textContent = "もう一度"; setButtons(["play", "title"]);
+  const c = k => counts[k] || 0, ratio = stageNice / notes.length;
+  const table = `<table><tr><td>NICE!</td><td>${c("NICE!")} / ${notes.length}</td></tr><tr><td>MISS</td><td>${c("MISS")}</td></tr>
+    <tr><td>MAX COMBO</td><td>${maxCombo}</td></tr></table>`;
+  if (hardcore) {
+    showMsg(`<h1>HARDCORE</h1><div class="big">${score}</div>${table}`);
+    setButtons(["retry", "title"]);
+  } else if (ratio >= 0.7) {
+    showMsg(`<h1>STAGE ${stage} CLEAR!</h1><div class="big">${score}</div>${table}`);
+    setButtons(["next", "title"]);
+  } else {
+    showMsg(`<h1>GAME OVER</h1>STAGE ${stage}　（7割以上でクリア）<div class="big">${score}</div>${table}`);
+    setButtons(["retry", "title"]);
+  }
 }
 
 $("start").addEventListener("click", async () => {
   const b = $("start"); b.disabled = true; b.textContent = "準備中…";
   try {
     await startCamera(); await initLandmarker();
-    wipe.style.display = "block"; setButtons(["play", "cam"]);
+    wipe.style.display = "block"; setButtons(["play", "hard", "cam"]);
     showMsg(`<h1>READY</h1>右上のワイプに手の線が出ていればOK。<br>PLAYで始めよう。`);
   } catch (e) {
     b.disabled = false; b.textContent = "カメラを起動";
@@ -385,6 +416,9 @@ $("start").addEventListener("click", async () => {
   }
 });
 $("play").addEventListener("click", startPlay);
+$("hard").addEventListener("click", () => beginRun(1, true, false));
+$("next").addEventListener("click", () => beginRun(stage + 1, false, true));
+$("retry").addEventListener("click", () => beginRun(hardcore ? 1 : stage, hardcore, false));
 $("pause").addEventListener("click", pausePlay);
 $("resume").addEventListener("click", resumePlay);
 $("title").addEventListener("click", toTitle);
