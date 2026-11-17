@@ -20,9 +20,10 @@
   html, body { margin: 0; height: 100%; background: #f3e9df; overflow: hidden;
     font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; touch-action: none; }
   canvas.full { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
-  #wipe { position: fixed; top: calc(env(safe-area-inset-top) + 12px); right: 12px; width: 96px; height: 128px;
+  #wipe { position: fixed; z-index: 5; top: calc(env(safe-area-inset-top) + 12px); right: 12px; width: 96px; height: 128px;
     border-radius: 12px; background: #1b1210cc; border: 1px solid #ffffff40; display: none; }
-  #msg { position: fixed; left: 50%; top: 30%; transform: translate(-50%, -50%); width: min(86vw, 360px);
+  #msg { position: fixed; left: 50%; top: calc(env(safe-area-inset-top) + 156px); transform: translateX(-50%); z-index: 2;
+    max-height: calc(100% - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 240px); overflow: auto; width: min(86vw, 360px);
     color: #3a221c; background: #fffaf3; border: 3px solid #4a2a22; border-radius: 18px; padding: 16px 18px;
     font-size: 14px; line-height: 1.8; text-align: center; box-shadow: 5px 5px 0 #4a2a22; }
   #msg h1 { font-family: "Bagel Fat One", sans-serif; font-weight: 400; font-size: 30px; margin: 0 0 6px; color: #f25f5c;
@@ -47,7 +48,7 @@
 <div id="msg">
   <h1>GROOOVY BEAT</h1>
   流れてくる手の形を、<b>黄色い円に着くまでに</b>作ろう。<br>
-  ✊ グー　✋ パー　✌️ チョキ　👌 OK<br>👉 指差し　🤘 メロイック　👍 グッド<br>
+  ☝️ 人差し指　🤘 メロイック　🖐️ パー　✊ グー<br>✌️ チョキ　🤙 シャカ　👌 OK<br>
   <span style="font-size:12px;opacity:.75">画面を見ながら、インカメラに手を向けて遊びます。</span>
 </div>
 
@@ -77,15 +78,17 @@ const BPM = 96, BEAT = 60 / BPM;
 let BEATc = BEAT;   // 今の曲の1拍の長さ（テンポごとに別の曲ファイルを使う）
 // 再生速度を変えると画面収録に音が入らなくなるため、テンポごとに作った曲を等速で鳴らす
 const beatFile = rate => { const k = Math.round(rate * 100); return k === 100 ? "groovy-beat.m4a" : `groovy-beat-${k}.m4a`; };
-const SHAPES = { fist: "✊", open: "✋", victory: "✌️", ok: "👌", point: "👉", rock: "🤘", thumb: "👍" };
-const BASIC = ["fist", "open", "victory", "ok"], PLUS = [...BASIC, "point", "rock"], ALL = [...PLUS, "thumb"];
+const SHAPES = { point: "☝️", rock: "🤘", open: "🖐️", fist: "✊", victory: "✌️", shaka: "🤙", ok: "👌" };
+const BASIC = ["fist", "open", "victory", "ok"], PLUS = [...BASIC, "point", "rock"], ALL = [...PLUS, "shaka"];
 // ステージ設定：間隔（拍）・使う形・テンポ倍率・小節数
 function stageConf(n) {
   if (n === 1) return { interval: 2, shapes: BASIC, rate: 1.0, bars: 8 };
   if (n === 2) return { interval: 2, shapes: PLUS,  rate: 1.1, bars: 8 };
   if (n === 3) return { interval: 1, shapes: PLUS,  rate: 1.1, bars: 8 };
-  return { interval: 1, shapes: ALL, rate: Math.min(1.6, 1.25 + (n - 4) * 0.1), bars: 8 };   // 4以降は👍も混ざり、速くなり続ける
+  return { interval: 1, shapes: ALL, rate: Math.min(1.6, 1.25 + (n - 4) * 0.1), bars: 8 };   // 4〜8（FINAL）は🤙も混ざり、速くなり続ける
 }
+const LAST_STAGE = 8;
+const stageName = n => n >= LAST_STAGE ? "FINAL STAGE" : `STAGE ${n}`;
 const HARD = { interval: 1, shapes: ALL, rate: 1.5, bars: 16 };
 function makeChart(conf, seedN) {
   let seed = 20261117 + seedN * 7919; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
@@ -207,10 +210,11 @@ function classify(lm) {
   if (i && m && !r && !p) return "victory";
   if (i && !m && !r && p) return "rock";
   if (i && !m && !r && !p) return "point";
-  if (!i && !m && !r && !p) {
-    // 親指が手のひらから離れて伸びていれば👍、そうでなければ✊
+  if (!i && !m && !r && !p) return "fist";
+  if (!i && !m && !r && p) {
+    // 小指だけ立っていて、親指も手のひらから離れて伸びていれば🤙
     const thumbOut = dist(lm[4], lm[5]) / palm > 0.6 && dist(lm[4], lm[0]) > dist(lm[3], lm[0]);
-    return thumbOut ? "thumb" : "fist";
+    return thumbOut ? "shaka" : "none";
   }
   return "none";
 }
@@ -321,7 +325,7 @@ function drawPlay(t) {
   }
   // スコア・コンボ
   popText(String(score).padStart(6, "0"), 92, 56, 30, "#fffaf3", "#f794b8");
-  popText(hardcore ? "HARDCORE" : `STAGE ${stage}`, 72, 92, 18, "#fffaf3", hardcore ? "#f25f5c" : "#7ea6d6");
+  popText(hardcore ? "HARDCORE" : stageName(stage), stage >= LAST_STAGE && !hardcore ? 84 : 72, 92, 18, "#fffaf3", hardcore ? "#f25f5c" : "#7ea6d6");
   if (combo >= 2) popText(`${combo} COMBO`, W / 2, laneY + r + 46, 24, "#fffaf3", "#7ea6d6");
 }
 
@@ -388,13 +392,13 @@ function beginRun(n, isHard, keepScore) {
   song.playbackRate = 1;
   notes = makeChart(conf, isHard ? 99 : n); history = []; combo = keepScore ? combo : 0; counts = {}; stageNice = 0; popups = [];
   song.currentTime = 0; const pr = song.play(); if (pr && pr.catch) pr.catch(() => {});
-  popups.push({ text: isHard ? "HARDCORE" : `STAGE ${n}`, born: performance.now(), big: true });
+  popups.push({ text: isHard ? "HARDCORE" : stageName(n), born: performance.now(), big: true });
   mode = "play"; msg.classList.add("hidden"); setButtons(["pause"]);
 }
 function startPlay() { beginRun(1, false, false); }
 function toTitle() {
   song.pause(); mode = "idle"; popups = [];
-  showMsg(`<h1>GROOOVY BEAT</h1>流れてくる手の形を、<b>黄色い円に着くまでに</b>作ろう。<br>✊ グー　✋ パー　✌️ チョキ　👌 OK<br>👉 指差し　🤘 メロイック　👍 グッド`);
+  showMsg(`<h1>GROOOVY BEAT</h1>流れてくる手の形を、<b>黄色い円に着くまでに</b>作ろう。<br>☝️ 人差し指　🤘 メロイック　🖐️ パー　✊ グー<br>✌️ チョキ　🤙 シャカ　👌 OK`);
   setButtons(["play", "hard", "cam"]);
 }
 function pausePlay() { if (mode !== "play") return; song.pause(); mode = "paused"; showMsg("<h1>PAUSE</h1>"); setButtons(["resume", "title"]); }
@@ -409,10 +413,10 @@ function finishPlay() {
     showMsg(`<h1>HARDCORE</h1><div class="big">${score}</div>${table}`);
     setButtons(["retry", "title"]);
   } else if (ratio >= 0.7) {
-    showMsg(`<h1>STAGE ${stage} CLEAR!</h1><div class="big">${score}</div>${table}`);
-    setButtons(["next", "title"]);
+    showMsg(`<h1>${stageName(stage)} CLEAR!</h1><div class="big">${score}</div>${table}`);
+    setButtons(stage >= LAST_STAGE ? ["title"] : ["next", "title"]);   // ファイナルの後は次がない
   } else {
-    showMsg(`<h1>GAME OVER</h1>STAGE ${stage}　（7割以上でクリア）<div class="big">${score}</div>${table}`);
+    showMsg(`<h1>GAME OVER</h1>${stageName(stage)}　（7割以上でクリア）<div class="big">${score}</div>${table}`);
     setButtons(["retry", "title"]);
   }
 }
